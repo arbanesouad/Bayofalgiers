@@ -1,0 +1,868 @@
+// --- 1. Définition du chemin de projet et Chargement des données ---
+var projectPath = 'projects/YOURPROJECT/assets/'; // remplace par chemin de ton asset où se trouvent les fichiers téléchargés du dossier DATA BA
+
+var AOI = ee.FeatureCollection(projectPath + 'AOI');
+print('DEBUG: AOI FeatureCollection (initial load):', AOI);
+var rivieres = ee.FeatureCollection(projectPath + 'rivieres_osm');
+var rivieres_intersectees = rivieres.filterBounds(AOI);
+var soilRaster = ee.Image(projectPath + 'SoilTypes_1');
+var NDBI2000 = ee.Image(projectPath + 'NDBI2000');
+var NDBI2022 = ee.Image(projectPath + 'NDBI2022');
+
+// Chargement des nouvelles couches
+var SBV_ALGER = ee.FeatureCollection(projectPath + 'SBV_ALGER');
+var BV_ALGEROIS = ee.FeatureCollection(projectPath + 'BV_ALGEROIS');
+
+// Load the importance/reclassified rasters for AHP
+var soil_importance = ee.Image(projectPath + 'soil_importance_alea');
+var precipitation_importance = ee.Image(projectPath + 'precipitation_importance_AHP');
+var pente_importance = ee.Image(projectPath + 'pente_pct_importance_alea');
+var landcover_reclass = ee.Image(projectPath + 'landcover_reclass');
+var distance_reclassified_river = ee.Image(projectPath + 'distance_reclassified_river');
+var densite_reclass = ee.Image(projectPath + 'densite_reclass');
+var altitude_importance = ee.Image(projectPath + 'altitude_importance_alea');
+
+// Load the monthly precipitation data (used for charts)
+var chirpsTable = ee.FeatureCollection('projects/thermal-shuttle-438007-a4/assets/CHIRPS_Monthly_Cleaned');
+var precipitationData = ee.FeatureCollection('projects/thermal-shuttle-438007-a4/assets/CHIRPS_Annual_Precipitation_2000_2022');
+
+
+// --- 2. Configuration initiale de la carte ---
+Map.centerObject(AOI, 10);
+Map.setOptions('HYBRID');
+Map.style().set('cursor', 'crosshair');
+
+// --- 3. Déclarations globales pour les couches dynamiques et leurs objets UI ---
+var chirpsLayerObject;
+var aleaLayerObject;
+
+// Déclaration de variables pour les couches d'aléa, utilisées dans le calcul AHP
+var finalNormalizedHazard;
+var alea_class_3;
+var alea_class_3_display; // This will hold the clipped version for display
+
+// NOUVEAU: Déclarations pour les panneaux des graphiques
+var chartAOIPrecipitationPanel;
+var annualChartPanel;
+var monthlyChartPanel;
+var timeSeriesChartPanel;
+
+
+// --- 4. Fonction de création de légende (modifiée pour continuous legend) ---
+function createLegendEntry(title, classNames, colors, isContinuous, minVal, maxVal, palette) {
+    var legendPanel = ui.Panel({
+        style: {
+            padding: '4px 8px',
+            backgroundColor: 'white',
+            border: '1px solid #ccc',
+            margin: '2px 0'
+        }
+    });
+
+    legendPanel.add(ui.Label({
+        value: title,
+        style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 4px 0'}
+    }));
+
+    if (isContinuous) {
+        var vis = {min: minVal, max: maxVal, palette: palette};
+        var legendThumb = ui.Thumbnail({
+            image: ee.Image.pixelLonLat().select(0),
+            params: {
+                bbox: [0, 0, 1, 0.1],
+                dimensions: '100x10',
+                format: 'png',
+                min: vis.min,
+                max: vis.max,
+                palette: vis.palette,
+            },
+            style: {stretch: 'horizontal', margin: '0px 8px'},
+        });
+        legendPanel.add(legendThumb);
+        legendPanel.add(ui.Panel({
+            widgets: [
+                ui.Label(String(minVal !== null ? minVal.toFixed(2) : 'N/A'), {margin: '2px 8px 0px 8px', fontSize: '10px'}),
+                ui.Label(String(maxVal !== null ? maxVal.toFixed(2) : 'N/A'), {margin: '2px 8px 0px 8px', textAlign: 'right', stretch: 'horizontal', fontSize: '10px'})
+            ],
+            layout: ui.Panel.Layout.Flow('horizontal')
+        }));
+
+    } else {
+        // Ensure classNames and colors are valid arrays
+        classNames = Array.isArray(classNames) ? classNames : [];
+        colors = Array.isArray(colors) ? colors : [];
+
+        classNames.forEach(function(name, i) {
+            legendPanel.add(ui.Panel({
+                widgets: [
+                    ui.Label({
+                        style: {
+                            backgroundColor: colors[i] || 'grey', // Fallback color
+                            padding: '6px',
+                            margin: '0 5px 0 0',
+                            width: '18px',
+                            height: '18px',
+                            border: '1px solid #ccc'
+                        }
+                    }),
+                    ui.Label({value: name, style: {fontSize: '12px'}})
+                ],
+                layout: ui.Panel.Layout.Flow('horizontal')
+            }));
+        });
+    }
+    return legendPanel;
+}
+
+// Global legend panel
+var mainUnifiedLegend = ui.Panel({
+    style: {
+        position: 'bottom-left',
+        padding: '8px 15px',
+        backgroundColor: 'white',
+        border: '1px solid black',
+        maxHeight: '80%', // Limit height to prevent overflow
+        maxWidth: '250px', // Limit width
+        shown: true,
+    }
+});
+
+mainUnifiedLegend.add(ui.Label({
+    value: 'Légende',
+    style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 6px 0'}
+}));
+Map.add(mainUnifiedLegend);
+
+var showHideAllLegendsCheckbox = ui.Checkbox('Show/Hide', true);
+showHideAllLegendsCheckbox.onChange(function(checked) {
+    mainUnifiedLegend.style().set('shown', checked);
+});
+mainUnifiedLegend.add(showHideAllLegendsCheckbox);
+
+
+function updateUnifiedLegend() {
+    mainUnifiedLegend.clear();
+    mainUnifiedLegend.add(ui.Label({
+        value: 'Légende',
+        style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 6px 0'}
+    }));
+    mainUnifiedLegend.add(showHideAllLegendsCheckbox); // Re-add the master checkbox
+
+    
+    // Iterate through current map layers to build the legend
+    Map.layers().forEach(function(layer) {
+        if (layer && layer.get('shown')) { // IMPORTANT: Check if layer object and if it's shown
+            var layerName = layer.get('name');
+            var visParams = layer.get('visParams') || {};
+            var layerObject = layer.get('eeObject');
+
+            // Find the corresponding config in layerConfigs for custom legend data
+            var config = null; // Initialize config
+            for (var i = 0; i < layerConfigs.length; i++) {
+                if (layerConfigs[i].name === layerName) {
+                    config = layerConfigs[i];
+                    break;
+                }
+            }
+
+            var hazardConfig = {
+                name: 'Aléa Inondation ',
+                legendType: 'categorical',
+                categories: ["Faible", "Modéré", "Élevé"],
+                colors: ["#1b5e20", "#f9a825", "#b71c1c"]
+            };
+
+            if (config) {
+                if (config.legendType === 'categorical') {
+                    var classNames = config.categories instanceof Array ? config.categories : [];
+                    if (!(config.categories instanceof Array)) {
+                        for (var key in config.categories) {
+                            if (config.categories.hasOwnProperty(key)) {
+                                classNames.push(config.categories[key].name);
+                            }
+                        }
+                    }
+                    var colors = config.colors || [];
+                    if (!(config.colors instanceof Array)) {
+                        for (var key_color in config.categories) {
+                            if (config.categories.hasOwnProperty(key_color)) {
+                                colors.push(config.categories[key_color].color);
+                            }
+                        }
+                    }
+                    mainUnifiedLegend.add(createLegendEntry(config.name, classNames, colors, false));
+                } else if (config.legendType === 'continuous') {
+                    var minVal = visParams.min;
+                    var maxVal = visParams.max;
+                    var palette = visParams.palette;
+                    mainUnifiedLegend.add(createLegendEntry(config.name, null, null, true, minVal, maxVal, palette));
+                } else if (config.legendType === 'vector') {
+                    var legendEntry = ui.Panel({
+                        widgets: [
+                            ui.Label({
+                                style: {
+                                    backgroundColor: config.color,
+                                    padding: '6px',
+                                    margin: '0 5px 0 0',
+                                    width: '18px',
+                                    height: '18px',
+                                    border: '1px solid #ccc'
+                                }
+                            }),
+                            ui.Label({value: config.name, style: {fontSize: '12px'}})
+                        ],
+                        layout: ui.Panel.Layout.Flow('horizontal')
+                    });
+                    mainUnifiedLegend.add(legendEntry);
+                }
+            } else if (layerName === 'Aléa Inondation') { // Explicitly add the hazard legend
+                mainUnifiedLegend.add(createLegendEntry(
+                    hazardConfig.name, hazardConfig.categories, hazardConfig.colors, false));
+            }
+           
+        }
+    });
+}
+
+
+// --- 5. Custom Layer Control Setup ---
+
+// Define layer configurations (this is key for custom control)
+var layerConfigs = [
+    {
+        object: AOI.style({color: 'red', fillColor: '00000000', width: 2}),
+        visParams: {},
+        name: 'Area of Interest(AOI)',
+        legendType: 'vector',
+        color: 'red'
+    },
+    {
+        object: rivieres_intersectees.style({color: 'blue', width: 2}),
+        visParams: {},
+        name: "Rivières AOI",
+        legendType: 'vector',
+        color: 'blue'
+    },
+    {
+        object: soilRaster.clip(AOI),
+        visParams: {min: 0, max: 30, palette: ['e41a1c', '377eb8', '4daf4a', '984ea3', 'ff7f00', '#ffff33']},
+        name: 'Types de sols ',
+        legendType: 'categorical',
+        categories: {
+            6: {name: "Cambisols", color: '#e41a1c'},
+            11: {name: "Fluvisols", color: '#377eb8'},
+            15: {name: "Kastanozems", color: '#4daf4a'},
+            18: {name: "Luvisols", color: '#984ea3'},
+            20: {name: "Phaeozems", color: '#ff7f00'},
+            29: {name: "Vertisols", color: '#ffff33'}
+        }
+    },
+    {
+        object: ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+            .filterBounds(AOI)
+            .filterDate('2023-01-01', '2023-12-31')
+            .select('label').mode().clip(AOI),
+        visParams: {
+            min: 0, max: 8,
+            palette: ["419bdf", "397d49", "88b053", "7a87c6", "e49635", "dfc35a", "c4281b", "a59b8f", "b39fe1"]
+        },
+        name: 'Occupation du sol (Dynamic World 2023)',
+        legendType: 'categorical',
+        categories: [
+            "Water", "Trees", "Grass", "Flooded vegetation", "Crops",
+            "Shrub & scrub", "Built-up", "Bare ground", "Snow/ice"
+        ],
+        colors: ["419bdf", "397d49", "88b053", "7a87c6", "e49635", "dfc35a", "c4281b", "a59b8f", "b39fe1"]
+    },
+    {
+        object: NDBI2000.clip(AOI),
+        visParams: {min: -0.5, max: 0.5, palette: ['blue', 'green', 'yellow', 'red']},
+        name: 'NDBI 2000',
+        legendType: 'continuous'
+    },
+    {
+        object: NDBI2022.clip(AOI),
+        visParams: {min: -0.5, max: 0.5, palette: ['blue', 'green', 'yellow', 'red']},
+        name: 'NDBI 2022',
+        legendType: 'continuous'
+    },
+    {
+        object: SBV_ALGER.style({color: 'green', fillColor: '00000000', width: 2}),
+        visParams: {},
+        name: 'Sous bassins versants Alger',
+        legendType: 'vector',
+        color: 'green'
+    },
+    {
+        object: BV_ALGEROIS.style({color: 'purple', fillColor: '00000000', width: 2}),
+        visParams: {},
+        name: 'Bassin versant ALGEROIS',
+        legendType: 'vector',
+        color: 'purple'
+    }
+    // Precipitation layer and Flood Hazard layer will be added dynamically
+];
+
+// Add initial layers to Map
+layerConfigs.forEach(function(cfg) {
+    var mapLayer = ui.Map.Layer(cfg.object, cfg.visParams, cfg.name, true); // Toujours visible par défaut
+    Map.add(mapLayer);
+});
+
+// Add the dynamic layers after the initial batch
+
+// Declare visParamsChirps with a default or empty object *before* its use.
+var visParamsChirps = {
+    min: 0, // Placeholder min
+    max: 1000, // Placeholder max
+    palette: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red'],
+    opacity: 0.7
+};
+
+var currentYear = 2022; // Declare currentYear here as it's used in layer name
+chirpsLayerObject = ui.Map.Layer( // Use globally declared variable
+    null, // Will be replaced with actual image
+    visParamsChirps, // Now visParamsChirps is defined
+    'Précipitation Annuelle ' + currentYear + ' (CHIRPS)',
+    true // Initially visible
+);
+Map.add(chirpsLayerObject);
+
+
+aleaLayerObject = ui.Map.Layer( // Use globally declared variable
+    null, // Will be replaced
+    {min: 0, max: 2, palette: ["#1b5e20", "#f9a825", "#b71c1c"]},
+    'Aléa Inondation (3 classes)',
+    true // Initially visible
+);
+Map.add(aleaLayerObject);
+
+
+// --- 6. Calculs pour les Couches Dynamiques (Précipitation et Aléa) ---
+
+// 6.1 Précipitation annuelle CHIRPS (2022) ---
+var start = ee.Date.fromYMD(currentYear, 1, 1);
+var end = start.advance(1, 'year');
+
+var chirps = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterBounds(AOI)
+    .filterDate(start, end)
+    .sum()
+    .clip(AOI)
+    .rename('precipitation');
+
+// Use evaluate to get the actual min/max for display in the legend
+chirps.reduceRegion({
+    reducer: ee.Reducer.min().combine(ee.Reducer.max(), '', true),
+    geometry: AOI.geometry(),
+    scale: 5000,
+    maxPixels: 1e13
+}).evaluate(function(stats) {
+    var minVal = stats['precipitation_min'] !== null ? stats['precipitation_min'] * 0.9 : 0;
+    var maxVal = stats['precipitation_max'] !== null ? stats['precipitation_max'] * 1.1 : 1000;
+    maxVal = Math.max(maxVal, minVal + 1); // Ensure max is at least 1 greater than min
+
+    var updatedVisParams = {
+        min: minVal,
+        max: maxVal,
+        palette: ['blue', 'cyan', 'green', 'yellow', 'orange', 'red'],
+        opacity: 0.7
+    };
+    // Update the chirps layer with the image and correct vis params
+    chirpsLayerObject.setEeObject(chirps);
+    chirpsLayerObject.setVisParams(updatedVisParams);
+    updateUnifiedLegend(); // Update legend after layer is fully defined
+});
+
+// 6.2 Harmonisation et Normalisation des couches (0-1) pour l'AHP ---
+var getBandMinMax = function(image, geometry, scale) {
+    var stats = image.reduceRegion({
+        reducer: ee.Reducer.min().combine(ee.Reducer.max(), null, true),
+        geometry: geometry,
+        scale: scale,
+        maxPixels: 1e13
+    });
+    var bandName = image.bandNames().get(0);
+
+    // Use ee.Algorithms.If for server-side conditional logic
+    var minVal = ee.Number(ee.Algorithms.If(stats.get(ee.String(bandName).cat('_min')), stats.get(ee.String(bandName).cat('_min')), 0));
+    var maxVal = ee.Number(ee.Algorithms.If(stats.get(ee.String(bandName).cat('_max')), stats.get(ee.String(bandName).cat('_max')), 1));
+
+    var safeMinVal = ee.Algorithms.If(
+        maxVal.lte(minVal),
+        minVal.subtract(0.0001),
+        minVal
+    );
+
+    var safeMaxVal = ee.Algorithms.If(
+        maxVal.lte(minVal),
+        maxVal.add(0.0001),
+        maxVal
+    );
+
+    return {
+        min: safeMinVal,
+        max: safeMaxVal
+    };
+};
+
+var defaultScale = 30; // Consistent scale for AHP layers
+
+// Use a self-invoking function to populate normalizedLayers
+var normalizedLayers = (function() {
+    var layers = {};
+    layers['soil'] = soil_importance.unitScale(getBandMinMax(soil_importance, AOI.geometry(), defaultScale).min, getBandMinMax(soil_importance, AOI.geometry(), defaultScale).max).rename('soil');
+    layers['precipitation'] = precipitation_importance.unitScale(getBandMinMax(precipitation_importance, AOI.geometry(), defaultScale).min, getBandMinMax(precipitation_importance, AOI.geometry(), defaultScale).max).rename('precipitation');
+    layers['pente'] = pente_importance.unitScale(getBandMinMax(pente_importance, AOI.geometry(), defaultScale).min, getBandMinMax(pente_importance, AOI.geometry(), defaultScale).max).rename('pente');
+    layers['landcover'] = landcover_reclass.unitScale(getBandMinMax(landcover_reclass, AOI.geometry(), defaultScale).min, getBandMinMax(landcover_reclass, AOI.geometry(), defaultScale).max).rename('landcover');
+    layers['distance_river'] = distance_reclassified_river.unitScale(getBandMinMax(distance_reclassified_river, AOI.geometry(), defaultScale).min, getBandMinMax(distance_reclassified_river, AOI.geometry(), defaultScale).max).rename('distance_river');
+    layers['densite'] = densite_reclass.unitScale(getBandMinMax(densite_reclass, AOI.geometry(), defaultScale).min, getBandMinMax(densite_reclass, AOI.geometry(), defaultScale).max).rename('densite');
+    layers['altitude'] = altitude_importance.unitScale(getBandMinMax(altitude_importance, AOI.geometry(), defaultScale).min, getBandMinMax(altitude_importance, AOI.geometry(), defaultScale).max).rename('altitude');
+    return layers;
+})();
+// 6.3 Définition de la Matrice AHP et des Poids ---
+var ahpWeights = ee.Dictionary({
+    'soil': 0.385,
+    'precipitation': 0.218,
+    'pente': 0.129,
+    'landcover': 0.076,
+    'distance_river': 0.076,
+    'densite': 0.052,
+    'altitude': 0.064
+});
+
+print('Poids AHP :', ahpWeights);
+
+
+// 6.4 Calcul de la Carte d'Aléa Pondérée ---
+var weightedHazard = ee.Image(0);
+
+// Iterate through the keys and use the 'layer' variable from normalizedLayers
+for (var key in normalizedLayers) {
+    var layer = normalizedLayers[key]; // Correctly assign layer from normalizedLayers
+    var weight = ee.Number(ahpWeights.get(key));
+    weightedHazard = weightedHazard.add(layer.multiply(weight));
+}
+
+// Calculate min/max for final normalization
+var minHazardFuture = weightedHazard.reduceRegion({
+    reducer: ee.Reducer.min(),
+    geometry: AOI.geometry(),
+    scale: 30,
+    maxPixels: 1e13
+}).values().get(0);
+
+var maxHazardFuture = weightedHazard.reduceRegion({
+    reducer: ee.Reducer.max(),
+    geometry: AOI.geometry(),
+    scale: 30,
+    maxPixels: 1e13
+}).values().get(0);
+
+// Use evaluate to get client-side values for final normalization, then define finalNormalizedHazard
+ee.List([minHazardFuture, maxHazardFuture]).evaluate(function(stats) {
+    var minHazard = ee.Number(stats[0]);
+    var maxHazard = ee.Number(stats[1]);
+
+    var safeMinHazard = ee.Algorithms.If(
+        maxHazard.lte(minHazard),
+        minHazard.subtract(0.0001),
+        minHazard
+    );
+
+    var safeMaxHazard = ee.Algorithms.If(
+        maxHazard.lte(minHazard),
+        maxHazard.add(0.0001),
+        maxHazard
+    );
+
+    finalNormalizedHazard = weightedHazard.unitScale(safeMinHazard, safeMaxHazard);
+
+    // 6.5 Classification en 3 classes ---
+    var seuils_3 = [0, 0.33, 0.66, 1.0];
+    var labels_3 = ["Faible", "Modéré", "Élevé"];
+    var colors_3 = ["#1b5e20", "#f9a825", "#b71c1c"];
+
+    alea_class_3 = finalNormalizedHazard.where(finalNormalizedHazard.lt(seuils_3[1]), 0)
+        .where(finalNormalizedHazard.gte(seuils_3[1]).and(finalNormalizedHazard.lt(seuils_3[2])), 1)
+        .where(finalNormalizedHazard.gte(seuils_3[2]), 2);
+
+    alea_class_3 = alea_class_3.rename('classification');
+
+    alea_class_3_display = alea_class_3.clip(AOI); // Now alea_class_3_display is defined
+
+    // Update the alea layer with the calculated image
+    aleaLayerObject.setEeObject(alea_class_3_display); // Use the globally declared aleaLayerObject
+    aleaLayerObject.setVisParams({min: 0, max: 2, palette: colors_3}); // Set visParams again
+    updateUnifiedLegend(); // Update legend after layer is fully defined
+});
+
+
+// --- 7. Ajout de popups d'infos pour AOI et Rivières ---
+
+var infoPanel = ui.Panel({
+    style: {
+        position: 'bottom-right',
+        padding: '8px',
+        width: '300px',
+        backgroundColor: 'white',
+        maxHeight: '200px'
+    }
+});
+Map.add(infoPanel);
+
+
+function showFeatureInfo(feature, layerName) {
+    infoPanel.clear();
+    infoPanel.add(ui.Label('Infos sur ' + layerName + ':'));
+
+    if (layerName === 'Area of Interest(AOI)') { 
+        feature.get('ADM2_EN').evaluate(function(val) {
+            infoPanel.add(ui.Label('ADM2_EN: ' + (val ? val : 'Non disponible')));
+        });
+        feature.get('ADM2_PCODE').evaluate(function(val) {
+            infoPanel.add(ui.Label('ADM2_PCODE: ' + (val ? val : 'Non disponible')));
+        });
+    } else if (layerName === 'Rivières AOI') {
+        feature.get('name').evaluate(function(val) {
+            var displayName = val && val !== '' ? val : 'Nom indisponible';
+            infoPanel.add(ui.Label('Nom de la rivière: ' + displayName));
+        });
+    } else if (layerName === 'Sous bassins versants Alger' || layerName === 'Bassin versant ALGEROIS') {
+        feature.propertyNames().evaluate(function(propertyNames) {
+            propertyNames.forEach(function(name) {
+                feature.get(name).evaluate(function(value) {
+                    var displayName = value !== null && value !== undefined ? value : 'Non disponible';
+                    infoPanel.add(ui.Label(name + ': ' + displayName));
+                });
+            });
+        });
+    }
+}
+
+// Attach click listener to the map
+Map.onClick(function(coords) {
+    var clickPoint = ee.Geometry.Point(coords.lon, coords.lat);
+
+    Map.layers().forEach(function(layer) {
+        var layerName = layer.get('name');
+        var eeObject = layer.get('eeObject');
+
+        if (layer.get('shown') && eeObject) {
+            if (eeObject instanceof ee.FeatureCollection) {
+                var filteredFeatures = eeObject.filterBounds(clickPoint);
+                filteredFeatures.size().evaluate(function(size) {
+                    if (size > 0) {
+                        filteredFeatures.first().evaluate(function(feature) {
+                            showFeatureInfo(ee.Feature(feature), layerName);
+                        });
+                    }
+                });
+            } else if (eeObject instanceof ee.Image) {
+                // If it's an image, get value at click point
+                eeObject.reduceRegion({
+                    reducer: ee.Reducer.first(),
+                    geometry: clickPoint,
+                    scale: 30 // Adjust scale as needed for image resolution
+                }).evaluate(function(value) {
+                    if (value) {
+                        infoPanel.clear();
+                        infoPanel.add(ui.Label('Infos sur ' + layerName + ':'));
+                        for (var band in value) {
+                            infoPanel.add(ui.Label(band + ': ' + (value[band] !== null ? value[band].toFixed(2) : 'N/A')));
+                        }
+                    }
+                });
+            }
+        }
+    });
+});
+
+
+// Use the globally defined AOI for consistency
+var aoi_geometry = AOI.geometry();
+
+// Charger la collection CHIRPS (précipitations quotidiennes)
+var chirpsCollectionDaily = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+    .filterDate('2000-01-01', '2022-12-31')
+    .filterBounds(aoi_geometry);
+
+// Calculer la précipitation annuelle totale sur l’AOI
+var years_range = ee.List.sequence(2000, 2022);
+
+var annualPrecipImages = ee.ImageCollection.fromImages(
+    years_range.map(function(year) {
+        var start_date = ee.Date.fromYMD(year, 1, 1);
+        var end_date = start_date.advance(1, 'year');
+        var yearlySum = chirpsCollectionDaily
+            .filterDate(start_date, end_date)
+            .sum()
+            .set('year', year)
+            .set('system:time_start', start_date.millis());
+        return yearlySum;
+    })
+);
+
+// Extraire la précipitation annuelle moyenne sur AOI en tant que FeatureCollection
+var annualPrecipStats = annualPrecipImages.map(function(image) {
+    var stats = image.reduceRegion({
+        reducer: ee.Reducer.mean(),
+        geometry: aoi_geometry,
+        scale: 5500,
+        maxPixels: 1e9
+    });
+
+    var precipitationMean = stats.get('precipitation');
+    var precipVal = ee.Algorithms.If(
+        precipitationMean,
+        ee.Number(precipitationMean),
+        0 // Default to 0 if precipitationMean is null/undefined
+    );
+
+    return ee.Feature(null, {
+        'year': image.get('year'),
+        'precip_mm': precipVal
+    });
+});
+
+var precipFc = ee.FeatureCollection(annualPrecipStats);
+
+// MODIFIÉ: Envelopper le graphique dans un panneau pour le contrôle de visibilité
+var chartAOIPrecipitation = ui.Chart.feature.byFeature({
+    features: precipFc,
+    xProperty: 'year',
+    yProperties: ['precip_mm']
+})
+.setOptions({
+    title: 'Précipitation Annuelle Moyenne (CHIRPS) sur AOI (2000-2022)',
+    hAxis: {title: 'Année', format: '####', gridlines: {count: 10}},
+    vAxis: {title: 'Précipitation (mm)'},
+    lineWidth: 2,
+    pointSize: 4,
+    series: {
+        0: {color: 'blue'}
+    }
+});
+chartAOIPrecipitationPanel = ui.Panel({
+  widgets: [chartAOIPrecipitation],
+  style: {stretch: 'horizontal', margin: '10px 0'}
+});
+
+
+// 2. Conversion des propriétés en nombres avec validation robuste
+var chirpsCleaned = chirpsTable.map(function(f) {
+    var yearVal = f.get('year');
+    var monthVal = f.get('month');
+    var precipVal = f.get('precip_mm');
+
+    var parsedYear = ee.Algorithms.If(
+        ee.String(yearVal).length().gt(0),
+        ee.Number.parse(ee.String(yearVal)),
+        ee.Number(0)
+    );
+    var parsedMonth = ee.Algorithms.If(
+        ee.String(monthVal).length().gt(0),
+        ee.Number.parse(ee.String(monthVal)),
+        ee.Number(0)
+    );
+    var parsedPrecip = ee.Algorithms.If(
+        ee.String(precipVal).length().gt(0),
+        ee.Number.parse(ee.String(precipVal)),
+        ee.Number(0)
+    );
+
+    return f.set({
+        year: parsedYear,
+        month: parsedMonth,
+        precip_mm: parsedPrecip,
+    });
+}).filter(ee.Filter.notNull(['year', 'month', 'precip_mm']));
+
+
+// 3. Calcul de la moyenne annuelle
+var annualAvg = chirpsCleaned
+    .filter(ee.Filter.notNull(['precip_mm']))
+    .reduceColumns({
+        selectors: ['year', 'precip_mm'],
+        reducer: ee.Reducer.mean().group({
+            groupField: 0,
+            groupName: 'year'
+        })
+    })
+    .get('groups');
+
+annualAvg = ee.List(annualAvg);
+
+var annualFeatures = annualAvg.map(function(obj) {
+    obj = ee.Dictionary(obj);
+    return ee.Feature(null, {
+        year: obj.get('year'),
+        precip_mm: obj.get('mean')
+    });
+});
+var annualFC = ee.FeatureCollection(annualFeatures);
+
+// MODIFIÉ: Envelopper le graphique dans un panneau pour le contrôle de visibilité
+var annualChart = ui.Chart.feature.byFeature(annualFC, 'year', 'precip_mm')
+    .setChartType('LineChart')
+    .setOptions({
+        title: 'Précipitations Moyennes Mensuelles par Année (CHIRPS)',
+        hAxis: {title: 'Année'},
+        vAxis: {title: 'Précipitation (mm)'},
+        lineWidth: 2,
+        pointSize: 4,
+        colors: ['royalblue']
+    });
+annualChartPanel = ui.Panel({
+  widgets: [annualChart],
+  style: {stretch: 'horizontal', margin: '10px 0'}
+});
+
+// 5. Calcul de la moyenne mensuelle (toutes années confondues)
+var monthlyAvg = chirpsCleaned
+    .filter(ee.Filter.notNull(['precip_mm']))
+    .reduceColumns({
+        selectors: ['month', 'precip_mm'],
+        reducer: ee.Reducer.mean().group({
+            groupField: 0,
+            groupName: 'month'
+        })
+    })
+    .get('groups');
+
+monthlyAvg = ee.List(monthlyAvg);
+
+var monthlyFeatures = monthlyAvg.map(function(obj) {
+    obj = ee.Dictionary(obj);
+    return ee.Feature(null, {
+        month: obj.get('month'),
+        precip_mm: obj.get('mean')
+    });
+});
+var monthlyFC = ee.FeatureCollection(monthlyFeatures);
+
+// 6. Graphique précipitations moyennes par mois
+var monthsLabels = ['Jan', 'Fév', 'Mar', 'Avr', 'Mai', 'Juin',
+    'Juil', 'Août', 'Sept', 'Oct', 'Nov', 'Déc'];
+
+var monthTicks = [];
+for (var i = 0; i < monthsLabels.length; i++) {
+    monthTicks.push({v: i + 1, f: monthsLabels[i]});
+}
+
+// MODIFIÉ: Envelopper le graphique dans un panneau pour le contrôle de visibilité
+var monthlyChart = ui.Chart.feature.byFeature(monthlyFC, 'month', 'precip_mm')
+    .setChartType('ColumnChart')
+    .setOptions({
+        title: 'Précipitations Moyennes par Mois (2000–2022)',
+        hAxis: {
+            title: 'Mois',
+            ticks: monthTicks
+        },
+        vAxis: {title: 'Précipitation (mm)'},
+        colors: ['#4A90E2']
+    });
+monthlyChartPanel = ui.Panel({
+  widgets: [monthlyChart],
+  style: {stretch: 'horizontal', margin: '10px 0'}
+});
+
+// 7. Pour la courbe temporelle complète, créer une propriété "date" pour chaque Feature
+var chirpsWithDate = chirpsCleaned.map(function(f) {
+    var year = ee.Number(f.get('year'));
+    var month = ee.Number(f.get('month'));
+    var date = ee.Date.fromYMD(year, month, 1);
+    return f.set('date', date.millis());
+});
+
+chirpsWithDate = chirpsWithDate.sort('date');
+
+// 8. Graphique temporel complet
+// MODIFIÉ: Envelopper le graphique dans un panneau pour le contrôle de visibilité
+var timeSeriesChart = ui.Chart.feature.byFeature(chirpsWithDate, 'date', 'precip_mm')
+    .setChartType('LineChart')
+    .setOptions({
+        title: 'Évolution Temporelle des Précipitations Mensuelles (2000-2022)',
+        hAxis: {title: 'Date'},
+        vAxis: {title: 'Précipitation (mm)'},
+        lineWidth: 2,
+        pointSize: 2,
+        colors: ['green'],
+        legend: {position: 'none'}
+    });
+timeSeriesChartPanel = ui.Panel({
+  widgets: [timeSeriesChart],
+  style: {stretch: 'horizontal', margin: '10px 0'}
+});
+
+
+// --- 9. Panneau de droite (Dashboard) ---
+var mainDashboardPanel = ui.Panel({
+    layout: ui.Panel.Layout.Flow('vertical'),
+    style: {
+        width: '350px',
+        padding: '10px',
+        position: 'top-right',
+        backgroundColor: 'white',
+        border: '1px solid #e0e0e0'
+    }
+});
+
+mainDashboardPanel.add(ui.Label('Précipitations', {
+    fontWeight: 'bold',
+    fontSize: '20px',
+    textAlign: 'center',
+    margin: '0 0 10px 0'
+}));
+
+// NOUVEAU: Case à cocher pour contrôler la visibilité du panneau principal
+var showHideDashboardCheckbox = ui.Checkbox('Show/Hide', true);
+showHideDashboardCheckbox.onChange(function(checked) {
+  mainDashboardPanel.style().set('shown', checked);
+
+});
+mainDashboardPanel.add(showHideDashboardCheckbox); // Ajoutez la case à cocher au panneau
+
+
+// NOUVEAU: Panneau de contrôle des graphiques
+var chartControlPanel = ui.Panel({
+  style: {
+    padding: '8px 15px',
+    backgroundColor: 'white',
+    border: '1px solid #e0e0e0',
+    margin: '10px 0',
+    stretch: 'horizontal',
+  }
+});
+chartControlPanel.add(ui.Label('Graphiques', {fontWeight: 'bold', fontSize: '16px'}));
+mainDashboardPanel.add(chartControlPanel); // Ajoutez ce panneau au tableau de bord principal
+
+// NOUVEAU: Cases à cocher pour chaque graphique
+var checkboxAOIPrecip = ui.Checkbox('Précipitation Annuelle sur AOI', true);
+checkboxAOIPrecip.onChange(function(checked) { chartAOIPrecipitationPanel.style().set('shown', checked); });
+chartControlPanel.add(checkboxAOIPrecip);
+
+var checkboxAnnualChart = ui.Checkbox('Précipitations Moyennes Mensuelles par Année', true);
+checkboxAnnualChart.onChange(function(checked) { annualChartPanel.style().set('shown', checked); });
+chartControlPanel.add(checkboxAnnualChart);
+
+var checkboxMonthlyChart = ui.Checkbox('Précipitations Moyennes par Mois', true);
+checkboxMonthlyChart.onChange(function(checked) { monthlyChartPanel.style().set('shown', checked); });
+chartControlPanel.add(checkboxMonthlyChart);
+
+var checkboxTimeSeriesChart = ui.Checkbox('Évolution Temporelle des Précipitations Mensuelles', true);
+checkboxTimeSeriesChart.onChange(function(checked) { timeSeriesChartPanel.style().set('shown', checked); });
+chartControlPanel.add(checkboxTimeSeriesChart);
+
+// AJOUTÉ: Ajoutez les panneaux de graphique au tableau de bord principal
+mainDashboardPanel.add(chartAOIPrecipitationPanel);
+mainDashboardPanel.add(annualChartPanel);
+mainDashboardPanel.add(monthlyChartPanel);
+mainDashboardPanel.add(timeSeriesChartPanel);
+
+
+Map.add(mainDashboardPanel);
+
+
+
+
