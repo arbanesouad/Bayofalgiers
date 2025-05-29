@@ -1,5 +1,5 @@
 // --- 1. Définition du chemin de projet et Chargement des données ---
-var projectPath = 'projects/YOURPROJECT/assets/'; // remplace par chemin de ton asset où se trouvent les fichiers téléchargés du dossier DATA BA
+var projectPath = 'projects/YOURPROJECT/assets/'; // remplace par chemin de ton asset où se trouvent les fichiers téléchargés 
 
 var AOI = ee.FeatureCollection(projectPath + 'AOI');
 print('DEBUG: AOI FeatureCollection (initial load):', AOI);
